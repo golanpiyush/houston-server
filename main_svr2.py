@@ -9,13 +9,15 @@ import logging
 import threading
 import time
 import random
-from flask.cli import F
-from typing import Dict
+import signal
+import sys
+from functools import wraps
+from typing import Dict, Optional, Any
 from yt_dlp import YoutubeDL
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from ytmusicapi import YTMusic
 from related_songs import fetch_related_songs, process_song, search_song
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, Response
 
 # Initialize Flask app
@@ -23,68 +25,127 @@ app = Flask(__name__)
 DATA_FILE = "data.json"
 USER_DATA_DIR = 'user_data'
 
-pref8 = '320'  # audio quality
-ints = 4  # number of related songs to send to client
-tO = 30  # timeout for streaming sessions
+# Configuration
+CONFIG = {
+    'audio_quality': '320',
+    'related_songs_count': 4,
+    'sse_timeout': 30,
+    'max_workers': 3,  # Reduced from 5 to prevent memory issues
+    'rate_limit_interval': 1.5,  # Reduced from 2 seconds
+    'max_retries': 2,  # Reduced from 3
+    'request_timeout': 15,  # Add timeout for requests
+    'max_concurrent_sessions': 10,  # Limit concurrent SSE sessions
+}
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging with better format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-UPLOAD_FOLDER = "profile_pics"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Ensure directories exist
+os.makedirs("profile_pics", exist_ok=True)
+os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-# API Key from Last.fm
+# Environment variables
 API_KEY = os.getenv('LASTFM_API_KEY', 'xyg')
 
-# YTMusic client
-yt_music = YTMusic()
+# Global instances with error handling
+try:
+    yt_music = YTMusic()
+    logger.info("YTMusic client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize YTMusic: {e}")
+    yt_music = None
 
-# Thread pool for concurrent tasks
-executor = ThreadPoolExecutor(max_workers=5)
-atexit.register(executor.shutdown, wait=True)
+# Thread pool with proper cleanup
+executor = ThreadPoolExecutor(max_workers=CONFIG['max_workers'])
+atexit.register(lambda: executor.shutdown(wait=False, cancel_futures=True))
 
-# Rate limiting variables
-last_request_time = 0
-min_request_interval = 2  # Minimum seconds between requests
-
-def rate_limit_delay():
-    """Add delay between requests to avoid rate limiting"""
-    global last_request_time
-    current_time = time.time()
-    elapsed = current_time - last_request_time
+# Rate limiting with thread safety
+class RateLimiter:
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self.last_request_time = 0
+        self._lock = threading.Lock()
     
-    if elapsed < min_request_interval:
-        sleep_time = min_request_interval - elapsed + random.uniform(0.5, 1.5)
-        time.sleep(sleep_time)
-    
-    last_request_time = time.time()
+    def wait_if_needed(self):
+        with self._lock:
+            current_time = time.time()
+            elapsed = current_time - self.last_request_time
+            
+            if elapsed < self.min_interval:
+                sleep_time = self.min_interval - elapsed + random.uniform(0.1, 0.3)
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
 
-# Load JSON data
-def load_data():
-    try:
-        with open(DATA_FILE, "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        return {"users": {}}
+rate_limiter = RateLimiter(CONFIG['rate_limit_interval'])
 
-# Save JSON data
-def save_data(data):
-    with open(DATA_FILE, "w") as file:
-        json.dump(data, file, indent=4)
-
-# Create directory if it doesn't exist
-if not os.path.exists(USER_DATA_DIR):
-    os.makedirs(USER_DATA_DIR)
-
-# Queue for SSE communication
+# Enhanced session management
 event_queues: Dict[str, queue.Queue] = {}
+session_threads: Dict[str, threading.Thread] = {}
+queue_lock = threading.Lock()
+
+def cleanup_session(session_id: str):
+    """Clean up session resources"""
+    with queue_lock:
+        if session_id in event_queues:
+            try:
+                # Clear any remaining items
+                while not event_queues[session_id].empty():
+                    event_queues[session_id].get_nowait()
+            except queue.Empty:
+                pass
+            del event_queues[session_id]
+        
+        if session_id in session_threads:
+            thread = session_threads[session_id]
+            if thread.is_alive():
+                # Thread will naturally die when function completes
+                pass
+            del session_threads[session_id]
 
 def create_queue_for_session(session_id: str) -> queue.Queue:
-    """Create a new queue for a session"""
-    if session_id not in event_queues:
-        event_queues[session_id] = queue.Queue()
-    return event_queues[session_id]
+    """Create a new queue for a session with limits"""
+    with queue_lock:
+        # Limit concurrent sessions
+        if len(event_queues) >= CONFIG['max_concurrent_sessions']:
+            # Clean up old sessions
+            old_sessions = list(event_queues.keys())[:len(event_queues) - CONFIG['max_concurrent_sessions'] + 1]
+            for old_session in old_sessions:
+                cleanup_session(old_session)
+        
+        if session_id not in event_queues:
+            event_queues[session_id] = queue.Queue(maxsize=50)  # Limit queue size
+        return event_queues[session_id]
+
+def timeout_handler(func):
+    """Decorator to add timeout handling"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        def target(result_queue):
+            try:
+                result = func(*args, **kwargs)
+                result_queue.put(('success', result))
+            except Exception as e:
+                result_queue.put(('error', e))
+        
+        result_queue = queue.Queue()
+        thread = threading.Thread(target=target, args=(result_queue,))
+        thread.daemon = True
+        thread.start()
+        
+        try:
+            status, result = result_queue.get(timeout=CONFIG['request_timeout'])
+            if status == 'error':
+                raise result
+            return result
+        except queue.Empty:
+            raise TimeoutError(f"Function {func.__name__} timed out after {CONFIG['request_timeout']} seconds")
+    
+    return wrapper
 
 def format_sse(data: str, event=None) -> str:
     """Format data for SSE"""
@@ -93,425 +154,319 @@ def format_sse(data: str, event=None) -> str:
         msg = f'event: {event}\n{msg}'
     return msg
 
-from dataclasses import is_dataclass
 def send_song_info(song_info, session_id: str, index=None, event_type="related_song"):
-    """Send song info through the event queue"""
-    if song_info and session_id in event_queues:
+    """Send song info through the event queue with error handling"""
+    if not song_info or session_id not in event_queues:
+        return
+    
+    try:
         song_dict = asdict(song_info) if is_dataclass(song_info) else song_info
         if index is not None:
             song_dict['index'] = index
-        event_queues[session_id].put((event_type, song_dict))
-
-async def process_related_songs(query: str, session_id: str):
-    """Process related songs and send via SSE"""
-    try:
-        loop = asyncio.get_event_loop()
-        search_results = await loop.run_in_executor(
-            None,
-            lambda: yt_music.search(query, filter="songs", limit=1)
-        )
         
-        if not search_results:
-            event_queues[session_id].put(("error", {"message": "No related songs found"}))
-            return
-            
-        main_song = await process_song(yt_music, search_results[0])
-        if main_song:
-            related_data = await loop.run_in_executor(
-                None,
-                lambda: yt_music.get_watch_playlist(videoId=main_song.video_id)
-            )
-            
-            related_tracks = related_data.get('tracks', [])[:ints]
-            
-            for index, track in enumerate(related_tracks, 1):
-                if track.get('videoId') == main_song.video_id:
-                    continue
-                    
-                song = await process_song(yt_music, track, main_song.video_id, index)
-                if song:
-                    send_song_info(song, session_id, index)
-        
-        # Signal completion
-        event_queues[session_id].put(("complete", {"message": "Related songs processing complete"}))
-        
+        # Use put_nowait to avoid blocking
+        event_queues[session_id].put_nowait((event_type, song_dict))
+    except queue.Full:
+        logger.warning(f"Queue full for session {session_id}, dropping message")
     except Exception as e:
-        logger.error(f"Error processing related songs: {e}")
-        event_queues[session_id].put(("error", {"message": str(e)}))
+        logger.error(f"Error sending song info: {e}")
 
-def run_async_processing(query: str, session_id: str):
-    """Run async processing in a separate thread"""
-    async def async_wrapper():
-        await process_related_songs(query, session_id)
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(async_wrapper())
-    loop.close()
-
-def get_yt_dlp_options():
-    """Get yt-dlp options with enhanced anti-detection measures"""
+def get_optimized_yt_dlp_options():
+    """Get optimized yt-dlp options for server environment"""
     return {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
         'noplaylist': True,
         'quiet': True,
-        'extractaudio': True,
         'no_warnings': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio', 
-            'preferredcodec': 'mp3', 
-            'preferredquality': '192'
-        }],
-        # Enhanced anti-detection headers
+        'extract_flat': False,
+        'socket_timeout': 10,
+        'retries': 1,  # Reduced retries
+        'fragment_retries': 1,
+        'skip_unavailable_fragments': True,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         },
-        # Additional options to avoid detection
-        'sleep_interval': 1,
-        'max_sleep_interval': 3,
-        'sleep_interval_requests': 1,
-        'sleep_interval_subtitles': 1,
-        # Retry options
-        'retries': 3,
-        'fragment_retries': 3,
-        'skip_unavailable_fragments': True,
-        # Use cookies if available (you can set this up)
-        'cookiefile': None,  # You can add a cookie file path here
-        # Extractor options
-        'extractor_retries': 3,
-        'file_access_retries': 3,
+        'extractor_retries': 1,
+        'file_access_retries': 1,
+        # Disable unnecessary features
+        'writesubtitles': False,
+        'writeautomaticsub': False,
+        'writedescription': False,
+        'writeinfojson': False,
+        'writethumbnail': False,
     }
 
-def fetch_song_details_fallback(song_name):
-    """Fallback method using YTMusic only without yt-dlp"""
+@timeout_handler
+def fetch_song_details_safe(song_name: str) -> Optional[Dict[str, Any]]:
+    """Thread-safe song details fetching with timeout"""
+    if not yt_music:
+        raise Exception("YTMusic client not initialized")
+    
+    rate_limiter.wait_if_needed()
+    
+    # Check if URL or search term
+    yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
+    match = re.search(yt_url_pattern, song_name)
+    
     try:
-        # Check if the input is a YouTube URL
-        yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
-        match = re.search(yt_url_pattern, song_name)
-        
         if match:
             video_id = match.group(1)
         else:
             search_results = yt_music.search(song_name, filter='songs', limit=1)
             if not search_results:
                 return None
-            song_info = search_results[0]
-            video_id = song_info.get('videoId')
+            video_id = search_results[0].get('videoId')
         
         if not video_id:
             return None
         
-        # Fetch detailed song information
+        # Get song details from YTMusic
         song_details = yt_music.get_song(video_id)
         
-        # Extract title
         title = song_details.get('videoDetails', {}).get('title', 'Unknown Title')
-        
-        # Extract artist using 'author' field
         artist = song_details.get('videoDetails', {}).get('author', 'Unknown Artist')
-        
-        # Fetch thumbnails
         thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
-        album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else 'No album art found'
+        album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else None
         
-        # Return without audio URL for now
+        # Try yt-dlp for audio URL (with timeout protection)
+        audio_url = None
+        try:
+            ydl_opts = get_optimized_yt_dlp_options()
+            with YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                audio_url = info_dict.get('url')
+        except Exception as e:
+            logger.warning(f"yt-dlp extraction failed: {e}")
+        
         return {
             'title': title,
             'artists': artist,
             'albumArt': album_art,
-            'audioUrl': f'https://www.youtube.com/watch?v={video_id}',  # YouTube URL as fallback
+            'audioUrl': audio_url or f'https://www.youtube.com/watch?v={video_id}',
             'videoId': video_id,
-            'fallback_mode': True
+            'fallback_mode': audio_url is None
         }
-    
+        
     except Exception as e:
-        logger.error(f"Error in fallback method: {e}")
+        logger.error(f"Error in fetch_song_details_safe: {e}")
         return None
 
-def fetch_song_details(song_name, max_retries=3):
-    """Enhanced song details fetching with multiple fallback strategies"""
-    for attempt in range(max_retries):
-        try:
-            # Add rate limiting delay
-            rate_limit_delay()
+async def process_related_songs_async(query: str, session_id: str):
+    """Async processing of related songs with better error handling"""
+    try:
+        if not yt_music:
+            raise Exception("YTMusic client not available")
+        
+        # Search for main song
+        search_results = yt_music.search(query, filter="songs", limit=1)
+        if not search_results:
+            event_queues[session_id].put_nowait(("error", {"message": "No related songs found"}))
+            return
+        
+        main_song = await process_song(yt_music, search_results[0])
+        if not main_song:
+            event_queues[session_id].put_nowait(("error", {"message": "Failed to process main song"}))
+            return
+        
+        # Get related tracks
+        related_data = yt_music.get_watch_playlist(videoId=main_song.video_id)
+        related_tracks = related_data.get('tracks', [])[:CONFIG['related_songs_count']]
+        
+        # Process tracks concurrently but limited
+        processed_count = 0
+        for index, track in enumerate(related_tracks, 1):
+            if session_id not in event_queues:  # Check if session still exists
+                break
+                
+            if track.get('videoId') == main_song.video_id:
+                continue
             
-            # Check if the input is a YouTube URL
-            yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
-            match = re.search(yt_url_pattern, song_name)
-            
-            if match:
-                video_id = match.group(1)
-            else:
-                search_results = yt_music.search(song_name, filter='songs', limit=1)
-                if not search_results:
-                    logger.warning(f"No search results found for: {song_name}")
-                    return None
-                song_info = search_results[0]
-                video_id = song_info.get('videoId')
-            
-            if not video_id:
-                logger.warning(f"No video ID found for: {song_name}")
-                return None
-            
-            # Fetch detailed song information using YTMusic
-            song_details = yt_music.get_song(video_id)
-            
-            # Extract title
-            title = song_details.get('videoDetails', {}).get('title', 'Unknown Title')
-            
-            # Extract artist using 'author' field
-            artist = song_details.get('videoDetails', {}).get('author', 'Unknown Artist')
-            
-            # Fetch thumbnails
-            thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
-            album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else 'No album art found'
-            
-            # Try to fetch audio URL using yt-dlp with enhanced options
             try:
-                ydl_opts = get_yt_dlp_options()
-                
-                with YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                    audio_url = info_dict.get('url', None)
-                
-                if not audio_url:
-                    raise Exception("No audio URL found")
-                
-                return {
-                    'title': title,
-                    'artists': artist,
-                    'albumArt': album_art,
-                    'audioUrl': audio_url,
-                    'videoId': video_id,
-                    'fallback_mode': False
-                }
-                
-            except Exception as yt_dlp_error:
-                logger.warning(f"yt-dlp failed (attempt {attempt + 1}): {yt_dlp_error}")
-                
-                # If this is the last attempt, return fallback response
-                if attempt == max_retries - 1:
-                    logger.info("Using fallback mode without direct audio URL")
-                    return {
-                        'title': title,
-                        'artists': artist,
-                        'albumArt': album_art,
-                        'audioUrl': f'https://www.youtube.com/watch?v={video_id}',
-                        'videoId': video_id,
-                        'fallback_mode': True,
-                        'message': 'Direct audio streaming unavailable, using YouTube link'
-                    }
-                
-                # Wait before retry
-                wait_time = (attempt + 1) * 2 + random.uniform(1, 3)
-                logger.info(f"Waiting {wait_time:.1f} seconds before retry...")
-                time.sleep(wait_time)
+                song = await process_song(yt_music, track, main_song.video_id, index)
+                if song:
+                    send_song_info(song, session_id, index)
+                    processed_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to process track {index}: {e}")
                 continue
         
-        except Exception as e:
-            logger.error(f"Error fetching song details (attempt {attempt + 1}): {e}")
-            if attempt == max_retries - 1:
-                # Try the complete fallback method
-                return fetch_song_details_fallback(song_name)
-            
-            # Wait before retry
-            wait_time = (attempt + 1) * 2 + random.uniform(1, 3)
-            time.sleep(wait_time)
-    
-    return None
+        # Signal completion
+        if session_id in event_queues:
+            event_queues[session_id].put_nowait(("complete", {
+                "message": "Related songs processing complete",
+                "processed_count": processed_count
+            }))
+        
+    except Exception as e:
+        logger.error(f"Error processing related songs: {e}")
+        if session_id in event_queues:
+            try:
+                event_queues[session_id].put_nowait(("error", {"message": str(e)}))
+            except queue.Full:
+                pass
+
+def run_async_processing_safe(query: str, session_id: str):
+    """Safe wrapper for async processing"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(process_related_songs_async(query, session_id))
+    except Exception as e:
+        logger.error(f"Error in async processing: {e}")
+        if session_id in event_queues:
+            try:
+                event_queues[session_id].put_nowait(("error", {"message": f"Processing failed: {str(e)}"}))
+            except queue.Full:
+                pass
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
+        cleanup_session(session_id)
+
+# Load/Save JSON data with error handling
+def load_data():
+    try:
+        with open(DATA_FILE, "r") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"users": {}}
+
+def save_data(data):
+    try:
+        with open(DATA_FILE, "w") as file:
+            json.dump(data, file, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
 
 @app.route('/get_song', methods=['POST'])
 def get_song():
-    """
-    Main endpoint for getting song details and initiating related songs processing.
-    
-    Expected request body:
-    {
-        "song_name": str,
-        "username": str,
-        "session_id": str (optional),
-        "streamer_status": str (either 'yeshoustonstreamer' or 'nohoustonstreamer')
-    }
-    """
+    """Optimized main endpoint for getting song details"""
     try:
-        data = request.json
+        data = request.get_json(force=True)
         if not data:
-            logger.error("No JSON data received in request")
             return jsonify({'error': 'No JSON data provided'}), 400
 
-        # Extract and validate required fields
+        # Validate required fields
         song_name = data.get('song_name')
         username = data.get('username')
         session_id = data.get('session_id')
-        streamer_status = data.get('streamer_status')
+        streamer_status = data.get('streamer_status', '').lower()
 
-        # Detailed request logging
-        logger.debug(f"Received request data: {data}")
+        if not song_name or not username:
+            return jsonify({'error': 'Missing required fields: song_name, username'}), 400
 
-        # Default isStreamer to False
-        is_streamer = ''
-        
-        if streamer_status:
-            # Check if the value corresponds to 'yeshoustonstreamer' or 'nohoustonstreamer'
-            if streamer_status.lower() == 'yeshoustonstreamer':
-                logger.info('yeshoustonstreamer')
-                is_streamer = True
-            elif streamer_status.lower() == 'nohoustonstreamer':
-                logger.info('nonhoustonstreamer')
-                is_streamer = False
-            else:
-                logger.warning(f"Invalid streamer_status value: {streamer_status}")
+        # Determine streamer mode
+        is_streamer = streamer_status == 'yeshoustonstreamer'
+        session_id = session_id or str(uuid.uuid4()) if is_streamer else None
 
-        logger.info(f"Final streamer mode value received: {is_streamer}")
+        logger.info(f"Processing request: song='{song_name}', user='{username}', streamer={is_streamer}")
 
-        # Validate required fields
-        if not song_name:
-            logger.error("Missing song_name field")
-            return jsonify({'error': 'Missing song_name field'}), 400
-        if not username:
-            logger.error("Missing username field")
-            return jsonify({'error': 'Missing username field'}), 400
+        # Create queue for streamers
+        if is_streamer and session_id:
+            create_queue_for_session(session_id)
 
-        # Generate or validate session_id
-        session_id = session_id or str(uuid.uuid4())
-        logger.debug(f"Using session_id: {session_id}")
-
-        # Initialize streamer queue if needed
-        if is_streamer:
-            try:
-                logger.debug(f"Attempting to create queue for session {session_id}")
-                create_queue_for_session(session_id)
-                logger.debug(f"Successfully created queue for session {session_id}")
-            except Exception as e:
-                logger.error(f"Failed to create queue for session {session_id}: {str(e)}")
-                return jsonify({'error': 'Failed to initialize streamer queue'}), 500
-
-        # Fetch song details with enhanced error handling
+        # Fetch song details with timeout protection
         try:
-            logger.debug(f"Fetching song details for: {song_name}")
-            song_details = fetch_song_details(song_name)
-            logger.debug(f"Fetched song details: {song_details}")
+            song_details = fetch_song_details_safe(song_name)
+        except TimeoutError:
+            logger.error("Song details fetch timed out")
+            return jsonify({'error': 'Request timed out, please try again'}), 408
         except Exception as e:
-            logger.error(f"Failed to fetch song details: {str(e)}")
+            logger.error(f"Error fetching song details: {e}")
             return jsonify({'error': 'Failed to fetch song details'}), 500
 
         if not song_details:
-            logger.warning(f"No results found for song: {song_name}")
-            return jsonify({'error': 'No results found'}), 404
+            return jsonify({'error': 'No results found for the requested song'}), 404
 
-        # Add requester information
         song_details['requested_by'] = username
 
         # Start related songs processing for streamers
-        if is_streamer:
+        if is_streamer and session_id:
             search_query = f"{song_details['title']} {song_details['artists']}"
-            logger.debug(f"Starting related songs processing with query: {search_query}")
-            thread = threading.Thread(
-                target=run_async_processing,
-                args=(search_query, session_id),
-                name=f"RelatedSongs-{session_id}"
-            )
-            thread.daemon = True
-            thread.start()
-            logger.info(f"Started related songs processing for session {session_id}")
+            
+            # Submit to thread pool
+            future = executor.submit(run_async_processing_safe, search_query, session_id)
+            session_threads[session_id] = future
 
-        # Prepare response
         response_data = {
             'song_details': song_details,
-            'message': 'Song details sent successfully.',
-            'session_id': session_id if is_streamer else None,
+            'message': 'Song details retrieved successfully',
+            'session_id': session_id,
             'streamer_mode': is_streamer
         }
-        
-        logger.debug(f"Sending response: {response_data}")
+
         return jsonify(response_data), 200
 
     except Exception as e:
-        logger.error(f"Unexpected error in get_song endpoint: {str(e)}", exc_info=True)
+        logger.error(f"Unexpected error in get_song: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
-# Rest of your routes remain the same...
 @app.route('/fetch_related_songs', methods=['POST'])
 def fetch_related_songs_route():
-    """
-    Endpoint to fetch related songs based on title and artist.
-    Streams results via SSE similar to get_song endpoint.
-    
-    Expected request body:
-    {
-        "title": str,
-        "artist": str,
-        "session_id": str
-    }
-    """
+    """Optimized endpoint for fetching related songs"""
     try:
-        data = request.get_json()
-        logger.info(f"Incoming payload for fetch_related_songs: {data}")
+        data = request.get_json(force=True)
         
-        # Validate required fields
         required_fields = ['title', 'artist', 'session_id']
         if not data or any(field not in data for field in required_fields):
-            logger.error("Missing required fields in payload")
             return jsonify({"error": "title, artist, and session_id are required"}), 400
         
         title = data['title']
         artist = data['artist']
         session_id = data['session_id']
         
-        # Create or get existing SSE queue
         create_queue_for_session(session_id)
-        
-        # Construct search query similar to get_song
         search_query = f"{title} {artist}"
-        logger.debug(f"Constructed search query: {search_query}")
-
-        # Start related songs processing in background thread
-        # Using the same processing function as get_song
-        thread = threading.Thread(
-            target=run_async_processing,
-            args=(search_query, session_id),
-            name=f"RelatedSongs-{session_id}"
-        )
-        thread.daemon = True
-        thread.start()
         
-        logger.info(f"Started related songs processing for session {session_id}")
+        # Submit to thread pool
+        future = executor.submit(run_async_processing_safe, search_query, session_id)
+        session_threads[session_id] = future
         
         return jsonify({
             "status": "success",
             "message": "Related songs processing initiated",
             "session_id": session_id
-        }), 202  # 202 Accepted indicates the request is being processed
+        }), 202
 
     except Exception as e:
-        logger.error(f"Error in fetch_related_songs_route: {str(e)}", exc_info=True)
-        if session_id in event_queues:
-            event_queues[session_id].put(("error", {"message": f"Processing failed: {str(e)}"}))
+        logger.error(f"Error in fetch_related_songs: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/stream_related_songs/<session_id>')
 def stream_related(session_id):
-    """SSE endpoint for streaming related songs"""
+    """Optimized SSE endpoint with better resource management"""
     if session_id not in event_queues:
         return jsonify({'error': 'Invalid session ID'}), 404
 
     def generate():
-        while True:
-            try:
-                event_type, data = event_queues[session_id].get(timeout=tO)
-                yield format_sse(json.dumps(data), event=event_type)
-                if event_type in ["complete", "error"]:
-                    # Clean up queue after completion
-                    del event_queues[session_id]
-                    break
-            except queue.Empty:
-                yield ': keepalive\n\n'
+        keepalive_count = 0
+        max_keepalives = CONFIG['sse_timeout'] // 5  # Send keepalive every 5 seconds
+        
+        try:
+            while keepalive_count < max_keepalives:
+                try:
+                    event_type, data = event_queues[session_id].get(timeout=5)
+                    yield format_sse(json.dumps(data), event=event_type)
+                    
+                    if event_type in ["complete", "error"]:
+                        break
+                        
+                except queue.Empty:
+                    yield ': keepalive\n\n'
+                    keepalive_count += 1
+                    continue
+        except GeneratorExit:
+            # Client disconnected
+            pass
+        finally:
+            # Clean up session
+            cleanup_session(session_id)
     
     return Response(
         generate(),
@@ -519,53 +474,51 @@ def stream_related(session_id):
         headers={
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'  # Disable nginx buffering
         }
     )
 
 @app.route('/fetchlyrics', methods=['GET'])
 def fetch_lyrics():
-    """
-    Endpoint to fetch song lyrics using YTMusic API.
-    Query Parameters:
-      - title: The song title (required)
-      - artist: The artist name (optional)
-    """
+    """Optimized lyrics fetching endpoint"""
     title = request.args.get('title')
     artist = request.args.get('artist')
 
     if not title:
         return jsonify({"error": "The 'title' parameter is required."}), 400
 
+    if not yt_music:
+        return jsonify({"error": "Music service unavailable"}), 503
+
     try:
-        query = title if not artist else f"{title} {artist}"
-        search_results = yt_music.search(query, filter="songs")
+        rate_limiter.wait_if_needed()
+        
+        query = f"{title} {artist}" if artist else title
+        search_results = yt_music.search(query, filter="songs", limit=1)
 
         if not search_results:
-            return jsonify({"error": "No songs found for the provided title and artist."}), 404
+            return jsonify({"error": "No songs found"}), 404
 
-        song = search_results[0]
-        video_id = song.get("videoId")
-
+        video_id = search_results[0].get("videoId")
         if not video_id:
-            return jsonify({"error": "Could not find a valid video ID for the song."}), 404
+            return jsonify({"error": "Invalid video ID"}), 404
 
         watch_playlist = yt_music.get_watch_playlist(video_id)
         browse_id = watch_playlist.get("lyrics")
 
         if not browse_id:
-            return jsonify({"error": "Lyrics not available for this song."}), 404
+            return jsonify({"error": "Lyrics not available"}), 404
 
         lyrics_data = yt_music.get_lyrics(browse_id)
-
         if not lyrics_data:
-            return jsonify({"error": "Lyrics not found for this song."}), 404
+            return jsonify({"error": "Lyrics not found"}), 404
 
         response = {
-            "lyrics": lyrics_data.get("lyrics", "Lyrics not available."),
+            "lyrics": lyrics_data.get("lyrics", "Lyrics not available"),
             "has_timestamps": lyrics_data.get("hasTimestamps", False),
         }
 
-        if lyrics_data.get("hasTimestamps", False):
+        if lyrics_data.get("hasTimestamps"):
             response["timed_lyrics"] = [
                 {
                     "text": line.get("text", ""),
@@ -578,62 +531,100 @@ def fetch_lyrics():
         return jsonify(response)
 
     except Exception as e:
-        return jsonify({"error": "An error occurred while fetching lyrics.", "details": str(e)}), 500
+        logger.error(f"Error fetching lyrics: {e}")
+        return jsonify({"error": "Failed to fetch lyrics"}), 500
 
-# Ensure user_data directory exists
-os.makedirs("user_data", exist_ok=True)
-
-# Route to handle login or ban users
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    username = data.get("username")
-    user_id = data.get("user_id")
-    login_time = data.get("login_time")
+    """User login/ban handling"""
+    try:
+        data = request.get_json(force=True)
+        username = data.get("username")
+        user_id = data.get("user_id")
+        login_time = data.get("login_time")
 
-    # Define user file path
-    user_file = f"user_data/{user_id}.txt"
+        if not all([username, user_id]):
+            return jsonify({"error": "Missing required fields"}), 400
 
-    # Check if user file exists
-    if os.path.exists(user_file):
+        user_file = os.path.join(USER_DATA_DIR, f"{user_id}.txt")
+
         # Check if user is banned
-        with open(user_file, 'r') as file:
-            lines = file.readlines()
-            for line in lines:
-                if line.startswith("Status: banned"):
-                    return jsonify({"message": f"User {user_id} is banned"}), 403
+        if os.path.exists(user_file):
+            try:
+                with open(user_file, 'r') as file:
+                    content = file.read()
+                    if "Status: banned" in content:
+                        return jsonify({"message": f"User {user_id} is banned"}), 403
+            except IOError:
+                pass
 
-    # Write or update user data
-    with open(user_file, 'w') as file:
-        file.write(f"Username: {username}\n")
-        file.write(f"User ID: {user_id}\n")
-        file.write(f"Login Time: {login_time}\n")
-        
-        # Check if the request includes a ban flag
-        if data.get("ban") == True:
-            file.write("Status: banned\n")
-            return jsonify({"message": f"User {user_id} has been banned"}), 200
-        else:
-            file.write("Status: active\n")
+        # Write user data
+        try:
+            with open(user_file, 'w') as file:
+                file.write(f"Username: {username}\n")
+                file.write(f"User ID: {user_id}\n")
+                file.write(f"Login Time: {login_time or 'Unknown'}\n")
+                
+                if data.get("ban"):
+                    file.write("Status: banned\n")
+                    return jsonify({"message": f"User {user_id} has been banned"}), 200
+                else:
+                    file.write("Status: active\n")
+        except IOError as e:
+            logger.error(f"Error writing user file: {e}")
+            return jsonify({"error": "Failed to save user data"}), 500
 
-    return jsonify({"message": f"User {user_id} login recorded"}), 200
+        return jsonify({"message": f"User {user_id} login recorded"}), 200
 
-# Route to get a user's info (for testing purposes)
+    except Exception as e:
+        logger.error(f"Error in login endpoint: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route('/user/<user_id>', methods=['GET'])
 def get_user(user_id):
+    """Get user information"""
     user_file = os.path.join(USER_DATA_DIR, f"{user_id}.txt")
-    if os.path.exists(user_file):
-        with open(user_file, 'r') as file:
-            user_data = file.read()
-        return f"<pre>{user_data}</pre>", 200
-    else:
-        return jsonify({"error": "User not found"}), 404
+    try:
+        if os.path.exists(user_file):
+            with open(user_file, 'r') as file:
+                user_data = file.read()
+            return f"<pre>{user_data}</pre>", 200
+        else:
+            return jsonify({"error": "User not found"}), 404
+    except Exception as e:
+        logger.error(f"Error reading user file: {e}")
+        return jsonify({"error": "Failed to read user data"}), 500
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "active_sessions": len(event_queues),
+        "ytmusic_available": yt_music is not None
+    }), 200
 
 @app.route("/")
 def index():
     return "Server is running : houston says hi!"
 
+# Graceful shutdown handling
+def signal_handler(signum, frame):
+    logger.info("Received shutdown signal, cleaning up...")
+    
+    # Clean up all sessions
+    with queue_lock:
+        for session_id in list(event_queues.keys()):
+            cleanup_session(session_id)
+    
+    # Shutdown thread pool
+    executor.shutdown(wait=False, cancel_futures=True)
+    
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
 if __name__ == "__main__":
-    logger.info("Starting server")
-    app.run(debug=True, threaded=True)
+    logger.info("Starting optimized music server")
+    app.run(debug=False, threaded=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
