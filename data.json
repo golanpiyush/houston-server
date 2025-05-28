@@ -1,0 +1,26 @@
+{
+    "users": {
+      "user123": {
+        "username": "Flywich",
+        "profile_picture": "https://example.com/image.jpg",
+        "current_song": "Epic Soundtrack",
+        "friends": ["user456"],
+        "friend_requests": ["user789"]
+      },
+      "user456": {
+        "username": "JohnDoe",
+        "profile_picture": "https://example.com/john.jpg",
+        "current_song": "Lofi Beats",
+        "friends": ["user123"],
+        "friend_requests": []
+      },
+      "user789": {
+        "username": "Alice",
+        "profile_picture": "https://example.com/alice.jpg",
+        "current_song": "Pop Hits",
+        "friends": [],
+        "friend_requests": []
+      }
+    }
+  }
+  

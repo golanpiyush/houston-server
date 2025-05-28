@@ -1,0 +1,46 @@
+2024-11-03 03:40:28,926 ||  * Debugger is active!
+2024-11-03 03:40:28,934 ||  * Debugger PIN: 483-354-970
+2024-11-03 03:40:38,612 || 127.0.0.1 - - [03/Nov/2024 03:40:38] "[31m[1mPOST /get_song HTTP/1.1[0m" 400 -
+2024-11-03 03:41:40,272 || 127.0.0.1 - - [03/Nov/2024 03:41:40] "GET /checkhealth HTTP/1.1" 200 -
+2024-11-03 03:42:30,419 || 127.0.0.1 - - [03/Nov/2024 03:42:30] "[31m[1mPOST /get_song HTTP/1.1[0m" 400 -
+2024-11-03 03:42:47,695 || [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2024-11-03 03:42:47,695 || [33mPress CTRL+C to quit[0m
+2024-11-03 03:42:47,708 ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:42:49,069 ||  * Debugger is active!
+2024-11-03 03:42:49,078 ||  * Debugger PIN: 483-354-970
+2024-11-03 03:42:49,087 || 127.0.0.1 - - [03/Nov/2024 03:42:49] "[31m[1mPOST /get_song HTTP/1.1[0m" 400 -
+2024-11-03 03:42:54,413 || 127.0.0.1 - - [03/Nov/2024 03:42:54] "[31m[1mPOST /get_song HTTP/1.1[0m" 400 -
+2024-11-03 03:43:02,585 || [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2024-11-03 03:43:02,585 || [33mPress CTRL+C to quit[0m
+2024-11-03 03:43:02,601 ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:43:03,934 ||  * Debugger is active!
+2024-11-03 03:43:03,942 ||  * Debugger PIN: 483-354-970
+2024-11-03 03:44:17,421 || [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2024-11-03 03:44:17,422 || [33mPress CTRL+C to quit[0m
+2024-11-03 03:44:17,438 ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:44:18,772 ||  * Debugger is active!
+2024-11-03 03:44:18,781 ||  * Debugger PIN: 483-354-970
+2024-11-03 03:45:31,379 || INFO || Server starting...
+2024-11-03 03:45:31,395 || INFO || [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2024-11-03 03:45:31,410 || INFO || [33mPress CTRL+C to quit[0m
+2024-11-03 03:45:31,425 || INFO ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:45:32,789 || INFO || Server starting...
+2024-11-03 03:45:32,804 || WARNING ||  * Debugger is active!
+2024-11-03 03:45:32,812 || INFO ||  * Debugger PIN: 483-354-970
+2024-11-03 03:45:36,017 || INFO ||  * Detected change in 'c:\\Users\\Houston\\Desktop\\houstonniggaman\\HoustonServerCode\\test.py', reloading
+2024-11-03 03:45:36,928 || INFO ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:45:38,391 || INFO || Server starting...
+2024-11-03 03:45:38,399 || WARNING ||  * Debugger is active!
+2024-11-03 03:45:38,412 || INFO ||  * Debugger PIN: 483-354-970
+2024-11-03 03:47:11,859 || INFO || Server starting...
+2024-11-03 03:47:11,901 || INFO || [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2024-11-03 03:47:11,901 || INFO || [33mPress CTRL+C to quit[0m
+2024-11-03 03:47:11,920 || INFO ||  * Restarting with watchdog (windowsapi)
+2024-11-03 03:47:13,844 || INFO || Server starting...
+2024-11-03 03:47:13,860 || WARNING ||  * Debugger is active!
+2024-11-03 03:47:13,867 || INFO ||  * Debugger PIN: 483-354-970
