@@ -28,7 +28,7 @@ USER_DATA_DIR = 'user_data'
 # Configuration
 CONFIG = {
     'audio_quality': '320',
-    'related_songs_count': 4,
+    'related_songs_count': 8,
     'sse_timeout': 30,
     'max_workers': 3,  # Reduced from 5 to prevent memory issues
     'rate_limit_interval': 1.5,  # Reduced from 2 seconds
@@ -101,10 +101,8 @@ def cleanup_session(session_id: str):
             del event_queues[session_id]
         
         if session_id in session_threads:
-            thread = session_threads[session_id]
-            if thread.is_alive():
-                # Thread will naturally die when function completes
-                pass
+            
+            # Remove the reference but don't try to interact with it
             del session_threads[session_id]
 
 def create_queue_for_session(session_id: str) -> queue.Queue:
@@ -310,7 +308,6 @@ async def process_related_songs_async(query: str, session_id: str):
                 pass
 
 def run_async_processing_safe(query: str, session_id: str):
-    """Safe wrapper for async processing"""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -327,8 +324,13 @@ def run_async_processing_safe(query: str, session_id: str):
             loop.close()
         except:
             pass
+        # Remove future reference after completion
+        with queue_lock:
+            if session_id in session_threads:
+                del session_threads[session_id]
         cleanup_session(session_id)
 
+        
 # Load/Save JSON data with error handling
 def load_data():
     try:
