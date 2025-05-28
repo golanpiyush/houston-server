@@ -7,6 +7,8 @@ import atexit
 import asyncio
 import logging
 import threading
+import time
+import random
 from flask.cli import F
 from typing import Dict
 from yt_dlp import YoutubeDL
@@ -23,7 +25,7 @@ USER_DATA_DIR = 'user_data'
 
 pref8 = '320'  # audio quality
 ints = 4  # number of related songs to send to client
-tO = 30  # timout for streaming sessions
+tO = 30  # timeout for streaming sessions
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +44,22 @@ yt_music = YTMusic()
 executor = ThreadPoolExecutor(max_workers=5)
 atexit.register(executor.shutdown, wait=True)
 
+# Rate limiting variables
+last_request_time = 0
+min_request_interval = 2  # Minimum seconds between requests
+
+def rate_limit_delay():
+    """Add delay between requests to avoid rate limiting"""
+    global last_request_time
+    current_time = time.time()
+    elapsed = current_time - last_request_time
+    
+    if elapsed < min_request_interval:
+        sleep_time = min_request_interval - elapsed + random.uniform(0.5, 1.5)
+        time.sleep(sleep_time)
+    
+    last_request_time = time.time()
+
 # Load JSON data
 def load_data():
     try:
@@ -54,7 +72,6 @@ def load_data():
 def save_data(data):
     with open(DATA_FILE, "w") as file:
         json.dump(data, file, indent=4)
-
 
 # Create directory if it doesn't exist
 if not os.path.exists(USER_DATA_DIR):
@@ -75,6 +92,7 @@ def format_sse(data: str, event=None) -> str:
     if event is not None:
         msg = f'event: {event}\n{msg}'
     return msg
+
 from dataclasses import is_dataclass
 def send_song_info(song_info, session_id: str, index=None, event_type="related_song"):
     """Send song info through the event queue"""
@@ -131,58 +149,47 @@ def run_async_processing(query: str, session_id: str):
     loop.run_until_complete(async_wrapper())
     loop.close()
 
-# def fetch_song_details(song_name):
-#     try:
-#         # Check if the input is a YouTube URL
-#         yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
-#         match = re.search(yt_url_pattern, song_name)
+def get_yt_dlp_options():
+    """Get yt-dlp options with enhanced anti-detection measures"""
+    return {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'extractaudio': True,
+        'no_warnings': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio', 
+            'preferredcodec': 'mp3', 
+            'preferredquality': '192'
+        }],
+        # Enhanced anti-detection headers
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        },
+        # Additional options to avoid detection
+        'sleep_interval': 1,
+        'max_sleep_interval': 3,
+        'sleep_interval_requests': 1,
+        'sleep_interval_subtitles': 1,
+        # Retry options
+        'retries': 3,
+        'fragment_retries': 3,
+        'skip_unavailable_fragments': True,
+        # Use cookies if available (you can set this up)
+        'cookiefile': None,  # You can add a cookie file path here
+        # Extractor options
+        'extractor_retries': 3,
+        'file_access_retries': 3,
+    }
 
-#         if match:
-#             video_id = match.group(1)
-#         else:
-#             search_results = yt_music.search(song_name, filter='songs', limit=1)
-#             if not search_results:
-#                 return None
-#             song_info = search_results[0]
-#             video_id = song_info.get('videoId')
-
-#         if not video_id:
-#             return None
-
-#         # Fetch detailed song information
-#         song_details = yt_music.get_song(video_id)
-#         title = song_details.get('videoDetails', {}).get('title', 'Unknown Title')
-#         artists = ", ".join([artist['name'] for artist in song_details.get('artists', [])])
-#         thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
-#         album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else 'No album art found'
-
-#         # Fetch audio URL using youtube_dl
-#         ydl_opts = {
-#             'format': 'bestaudio/best',
-#             'noplaylist': True,
-#             'quiet': True,
-#             'extractaudio': True,
-#             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-#         }
-
-#         with YoutubeDL(ydl_opts) as ydl:
-#             info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-#             audio_url = info_dict.get('url', 'No audio URL found')
-#         print(artists)
-
-#         return {
-#             'title': title,
-#             'artists': artists,
-#             'albumArt': album_art,
-#             'audioUrl': audio_url,
-#             'videoId': video_id
-#         }
-
-#     except Exception as e:
-#         logger.error(f"Error fetching song details: {e}")
-#         return None
-
-def fetch_song_details(song_name):
+def fetch_song_details_fallback(song_name):
+    """Fallback method using YTMusic only without yt-dlp"""
     try:
         # Check if the input is a YouTube URL
         yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
@@ -213,30 +220,111 @@ def fetch_song_details(song_name):
         thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
         album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else 'No album art found'
         
-        # Fetch audio URL using youtube_dl
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'quiet': True,
-            'extractaudio': True,
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        }
-        
-        with YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            audio_url = info_dict.get('url', 'No audio URL found')
-        
+        # Return without audio URL for now
         return {
             'title': title,
             'artists': artist,
             'albumArt': album_art,
-            'audioUrl': audio_url,
-            'videoId': video_id
+            'audioUrl': f'https://www.youtube.com/watch?v={video_id}',  # YouTube URL as fallback
+            'videoId': video_id,
+            'fallback_mode': True
         }
     
     except Exception as e:
-        logger.error(f"Error fetching song details: {e}")
+        logger.error(f"Error in fallback method: {e}")
         return None
+
+def fetch_song_details(song_name, max_retries=3):
+    """Enhanced song details fetching with multiple fallback strategies"""
+    for attempt in range(max_retries):
+        try:
+            # Add rate limiting delay
+            rate_limit_delay()
+            
+            # Check if the input is a YouTube URL
+            yt_url_pattern = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)"
+            match = re.search(yt_url_pattern, song_name)
+            
+            if match:
+                video_id = match.group(1)
+            else:
+                search_results = yt_music.search(song_name, filter='songs', limit=1)
+                if not search_results:
+                    logger.warning(f"No search results found for: {song_name}")
+                    return None
+                song_info = search_results[0]
+                video_id = song_info.get('videoId')
+            
+            if not video_id:
+                logger.warning(f"No video ID found for: {song_name}")
+                return None
+            
+            # Fetch detailed song information using YTMusic
+            song_details = yt_music.get_song(video_id)
+            
+            # Extract title
+            title = song_details.get('videoDetails', {}).get('title', 'Unknown Title')
+            
+            # Extract artist using 'author' field
+            artist = song_details.get('videoDetails', {}).get('author', 'Unknown Artist')
+            
+            # Fetch thumbnails
+            thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
+            album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else 'No album art found'
+            
+            # Try to fetch audio URL using yt-dlp with enhanced options
+            try:
+                ydl_opts = get_yt_dlp_options()
+                
+                with YoutubeDL(ydl_opts) as ydl:
+                    info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                    audio_url = info_dict.get('url', None)
+                
+                if not audio_url:
+                    raise Exception("No audio URL found")
+                
+                return {
+                    'title': title,
+                    'artists': artist,
+                    'albumArt': album_art,
+                    'audioUrl': audio_url,
+                    'videoId': video_id,
+                    'fallback_mode': False
+                }
+                
+            except Exception as yt_dlp_error:
+                logger.warning(f"yt-dlp failed (attempt {attempt + 1}): {yt_dlp_error}")
+                
+                # If this is the last attempt, return fallback response
+                if attempt == max_retries - 1:
+                    logger.info("Using fallback mode without direct audio URL")
+                    return {
+                        'title': title,
+                        'artists': artist,
+                        'albumArt': album_art,
+                        'audioUrl': f'https://www.youtube.com/watch?v={video_id}',
+                        'videoId': video_id,
+                        'fallback_mode': True,
+                        'message': 'Direct audio streaming unavailable, using YouTube link'
+                    }
+                
+                # Wait before retry
+                wait_time = (attempt + 1) * 2 + random.uniform(1, 3)
+                logger.info(f"Waiting {wait_time:.1f} seconds before retry...")
+                time.sleep(wait_time)
+                continue
+        
+        except Exception as e:
+            logger.error(f"Error fetching song details (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                # Try the complete fallback method
+                return fetch_song_details_fallback(song_name)
+            
+            # Wait before retry
+            wait_time = (attempt + 1) * 2 + random.uniform(1, 3)
+            time.sleep(wait_time)
+    
+    return None
 
 @app.route('/get_song', methods=['POST'])
 def get_song():
@@ -304,7 +392,7 @@ def get_song():
                 logger.error(f"Failed to create queue for session {session_id}: {str(e)}")
                 return jsonify({'error': 'Failed to initialize streamer queue'}), 500
 
-        # Fetch song details
+        # Fetch song details with enhanced error handling
         try:
             logger.debug(f"Fetching song details for: {song_name}")
             song_details = fetch_song_details(song_name)
@@ -348,6 +436,7 @@ def get_song():
         logger.error(f"Unexpected error in get_song endpoint: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
+# Rest of your routes remain the same...
 @app.route('/fetch_related_songs', methods=['POST'])
 def fetch_related_songs_route():
     """
@@ -491,7 +580,6 @@ def fetch_lyrics():
     except Exception as e:
         return jsonify({"error": "An error occurred while fetching lyrics.", "details": str(e)}), 500
 
-
 # Ensure user_data directory exists
 os.makedirs("user_data", exist_ok=True)
 
@@ -530,7 +618,6 @@ def login():
 
     return jsonify({"message": f"User {user_id} login recorded"}), 200
 
-
 # Route to get a user's info (for testing purposes)
 @app.route('/user/<user_id>', methods=['GET'])
 def get_user(user_id):
@@ -542,15 +629,6 @@ def get_user(user_id):
     else:
         return jsonify({"error": "User not found"}), 404
 
-
-
-
-
-
-
-
-
-
 if __name__ == "__main__":
-    logger.info("Starting server")
+    logger.info("Starting server with enhanced YouTube handling")
     app.run(debug=True, threaded=True)
