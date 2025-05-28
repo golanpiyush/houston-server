@@ -629,6 +629,11 @@ def get_user(user_id):
     else:
         return jsonify({"error": "User not found"}), 404
 
+
+@app.route("/")
+def index():
+    return "Server is running : houston says hi!
+
 if __name__ == "__main__":
-    logger.info("Starting server with enhanced YouTube handling")
+    logger.info("Starting server")
     app.run(debug=True, threaded=True)
