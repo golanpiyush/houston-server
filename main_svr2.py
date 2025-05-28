@@ -632,7 +632,7 @@ def get_user(user_id):
 
 @app.route("/")
 def index():
-    return "Server is running : houston says hi!
+    return "Server is running : houston says hi!"
 
 if __name__ == "__main__":
     logger.info("Starting server")
