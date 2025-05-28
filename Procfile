@@ -1,1 +1,1 @@
-web: gunicorn main_svr2:app
+web: python main_svr2.py
