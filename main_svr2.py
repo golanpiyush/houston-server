@@ -628,5 +628,4 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
-    logger.info("Starting optimized music server")
-    app.run(debug=False, threaded=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    app.run(host="0.0.0.0", port=5000)
