@@ -2,3 +2,4 @@ gunicorn
 Flask
 yt_dlp
 ytmusicapi
+aiohttp
