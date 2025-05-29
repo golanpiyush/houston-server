@@ -170,37 +170,50 @@ def send_song_info(song_info, session_id: str, index=None, event_type="related_s
         logger.error(f"Error sending song info: {e}")
 
 def get_optimized_yt_dlp_options():
-    """Get optimized yt-dlp options for server environment"""
+    """Get optimized yt-dlp options for server environment with better IP handling"""
     return {
         'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        'socket_timeout': 10,
-        'retries': 1,  # Reduced retries
-        'fragment_retries': 1,
+        'socket_timeout': 15,  # Increased timeout
+        'retries': 2,
+        'fragment_retries': 2,
         'skip_unavailable_fragments': True,
+        # Enhanced headers to appear more like a regular browser
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
         },
-        'extractor_retries': 1,
-        'file_access_retries': 1,
+        'extractor_retries': 2,
+        'file_access_retries': 2,
+        # Add proxy support if needed
+        # 'proxy': 'http://proxy-server:port',  # Uncomment if you have a proxy
+        # YouTube-specific options
+        'youtube_include_dash_manifest': False,  # Skip DASH manifest
+        'youtube_skip_dash_manifest': True,
         # Disable unnecessary features
         'writesubtitles': False,
         'writeautomaticsub': False,
         'writedescription': False,
         'writeinfojson': False,
         'writethumbnail': False,
+        # Add debugging for deployment
+        'verbose': False,  # Set to True temporarily for debugging
     }
 
 @timeout_handler
 def fetch_song_details_safe(song_name: str) -> Optional[Dict[str, Any]]:
-    """Thread-safe song details fetching with timeout"""
+    """Thread-safe song details fetching with timeout and enhanced fallback"""
     if not yt_music:
         raise Exception("YTMusic client not initialized")
     
@@ -230,29 +243,77 @@ def fetch_song_details_safe(song_name: str) -> Optional[Dict[str, Any]]:
         thumbnails = song_details.get('videoDetails', {}).get('thumbnail', {}).get('thumbnails', [])
         album_art = sorted(thumbnails, key=lambda x: (x.get('width', 0), x.get('height', 0)))[-1]['url'] if thumbnails else None
         
-        # Try yt-dlp for audio URL (with timeout protection)
+        # Try multiple approaches for audio URL
         audio_url = None
+        fallback_mode = False
+        
+        # Method 1: Try yt-dlp with enhanced options
         try:
             ydl_opts = get_optimized_yt_dlp_options()
             with YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
                 audio_url = info_dict.get('url')
+                if audio_url:
+                    logger.info(f"yt-dlp extraction successful for {video_id}")
         except Exception as e:
-            logger.warning(f"yt-dlp extraction failed: {e}")
+            logger.warning(f"yt-dlp extraction failed for {video_id}: {e}")
         
-        return {
+        # Method 2: Try with different yt-dlp format selector
+        if not audio_url:
+            try:
+                ydl_opts_alt = get_optimized_yt_dlp_options()
+                ydl_opts_alt['format'] = 'bestaudio/best'  # More permissive format
+                with YoutubeDL(ydl_opts_alt) as ydl:
+                    info_dict = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                    audio_url = info_dict.get('url')
+                    if audio_url:
+                        logger.info(f"yt-dlp alternative extraction successful for {video_id}")
+            except Exception as e:
+                logger.warning(f"yt-dlp alternative extraction failed for {video_id}: {e}")
+        
+        # Method 3: Try to get streaming data from YTMusic (if available)
+        if not audio_url:
+            try:
+                # Some versions of ytmusicapi might have streaming data
+                streaming_data = song_details.get('streamingData', {})
+                formats = streaming_data.get('adaptiveFormats', []) or streaming_data.get('formats', [])
+                
+                # Look for audio-only formats
+                audio_formats = [f for f in formats if f.get('mimeType', '').startswith('audio/')]
+                if audio_formats:
+                    # Sort by quality and pick the best
+                    best_audio = max(audio_formats, key=lambda x: x.get('bitrate', 0))
+                    audio_url = best_audio.get('url')
+                    if audio_url:
+                        logger.info(f"YTMusic streaming data extraction successful for {video_id}")
+            except Exception as e:
+                logger.warning(f"YTMusic streaming data extraction failed for {video_id}: {e}")
+        
+        # Set fallback mode if no direct audio URL found
+        if not audio_url:
+            fallback_mode = True
+            audio_url = f'https://www.youtube.com/watch?v={video_id}'
+            logger.warning(f"Using fallback mode for {video_id}")
+        
+        result = {
             'title': title,
             'artists': artist,
             'albumArt': album_art,
-            'audioUrl': audio_url or f'https://www.youtube.com/watch?v={video_id}',
+            'audioUrl': audio_url,
             'videoId': video_id,
-            'fallback_mode': audio_url is None
+            'fallback_mode': fallback_mode
         }
+        
+        # Add deployment environment info for debugging
+        result['extraction_method'] = 'fallback' if fallback_mode else 'direct'
+        result['server_env'] = os.getenv('RAILWAY_ENVIRONMENT_NAME', 'local')
+        
+        return result
         
     except Exception as e:
         logger.error(f"Error in fetch_song_details_safe: {e}")
         return None
-
+    
 async def process_related_songs_async(query: str, session_id: str):
     """Async processing of related songs with better error handling"""
     try:
@@ -628,4 +689,5 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    logger.info("Starting optimized music server")
+    app.run(debug=False, threaded=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
